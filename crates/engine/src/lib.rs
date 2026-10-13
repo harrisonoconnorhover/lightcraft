@@ -495,6 +495,7 @@ impl Session {
     }
 
     fn apply_catalog(&mut self, op: Op) -> Result<Op> {
+        self.invalidate_changed_smart_previews(&op)?;
         let inv = self.catalog.apply(op.clone())?;
         let mut pending = vec![&op];
         while let Some(op) = pending.pop() {
@@ -506,6 +507,37 @@ impl Session {
             }
         }
         Ok(inv)
+    }
+
+    /// Reload, Relink and their Undo/Redo can change how unchanged file bytes are decoded.
+    /// Discard proxies before applying that interpretation, including operations inside batches.
+    fn invalidate_changed_smart_previews(&self, op: &Op) -> Result<()> {
+        let Some(dir) = &self.media.smart_dir else { return Ok(()) };
+        let mut pending = vec![op];
+        let mut proxies = std::collections::HashSet::new();
+        while let Some(op) = pending.pop() {
+            match op {
+                Op::SetContent { id, preview_only, .. } => {
+                    if let Some(ph) = self.catalog.photo(*id)
+                        && ph.preview_only.is_some() != preview_only.is_some()
+                    {
+                        // The content-addressed name and look version do not encode JPEG vs raw.
+                        proxies.insert(crate::smart::sharded_file_path(dir, ph));
+                        proxies.insert(dir.join(crate::smart::file_name(ph)));
+                    }
+                }
+                Op::Batch { ops } => pending.extend(ops),
+                _ => {}
+            }
+        }
+        for path in proxies {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(EngineError::Other(format!("can't invalidate smart preview {}: {e}", path.display())));
+            }
+        }
+        Ok(())
     }
 
     /// [`Session::commit`] for an op that goes with a folder already renamed on disk; the undo
